@@ -10,7 +10,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 #define VOLTAGE_CONSTANTA       5
 #define CURRENT_SENSITIVITY     0.185
-#define CURRENT_OFFSET          2.5
+#define CURRENT_OFFSET          2.48
 
 #define SENSOR_LOOP             10
 #define SENSOR_DELAY            1000
@@ -20,21 +20,37 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 typedef struct{
     float voltage;
     float current;
-    float rpm;
+    unsigned int rpm;
 }DataTypeDef;
 
+volatile byte rpmcount;
+unsigned long timeold;
+
 void rpm_counter(void);
+
 void baca_sensor(void);
 void cetak_data(void);
 void cetak_judul(void);
 
-uint32_t rpm_count = 0;
+#define CONSTANT_R	10.0
+#define CONSTANT_Q	0.1
 
-uint32_t rpm_time;
+typedef struct{
+	float xtUpdate;
+	float xtPrev;
+	float ptUpdate;
+	float ptPref;
+	float kt;
+	float xt;
+	float pt;
+}FILTER_PROPERTIES;
+
+float filter(float input, FILTER_PROPERTIES* fVariable);
+float filterRpm(float input);
+
 uint32_t sensor_time;
 uint32_t display_time;
 uint32_t led_time;
-
 uint8_t led_state = LOW;
 
 DataTypeDef data_sensor;
@@ -44,14 +60,16 @@ void setup(){
 
     pinMode(LED_BUILTIN, OUTPUT);
     pinMode(RPM_PIN, INPUT_PULLUP);
-
-    // attachInterrupt(RPM_INTERRUPT_PIN, rpm_counter, RISING);
+    attachInterrupt(RPM_INTERRUPT_PIN, rpm_counter, FALLING);
 
     lcd.init();
     lcd.init();
     lcd.backlight();
     
     cetak_judul();
+
+    rpmcount = 0;
+    timeold = 0;
 }
 
 void loop(){
@@ -81,7 +99,10 @@ void loop(){
 }
 
 void rpm_counter(void){
-    rpm_count++;
+    detachInterrupt(RPM_INTERRUPT_PIN);
+    rpmcount++;
+    delay(5);
+    attachInterrupt(RPM_INTERRUPT_PIN, rpm_counter, FALLING);
 };
 
 void baca_sensor(void){
@@ -107,31 +128,26 @@ void baca_sensor(void){
     /* Hitung Arus */
     data_sensor.current = (float) ((pinArus / SENSOR_LOOP) - CURRENT_OFFSET) / CURRENT_SENSITIVITY;
 
+    if(data_sensor.current > -0.1 && data_sensor.current < 0.1){
+        data_sensor.current = 0.0;
+    }
+
     /* Baca RPM */
-    // detachInterrupt(RPM_INTERRUPT_PIN);
-
-    // Serial.println(rpm_count);
-    // Serial.println((millis() - sensor_time));
-    
-    // float rpm = (float) rpm_count * (60000 / (millis() - sensor_time));
-
-    // rpm_count = 0;
-
-    // attachInterrupt(RPM_INTERRUPT_PIN, rpm_counter, RISING);
-
-    unsigned long rpm_pulse = pulseIn(RPM_PIN, LOW, 1000000);
-
-    float rpm;
-    if(rpm_pulse > 0){
-        rpm = (float) 60000000 / rpm_pulse;
-    }
-    else{
-        rpm = 0.0;
-    }
-
+    //Don't process interrupts during calculations
+    detachInterrupt(RPM_INTERRUPT_PIN);
+    //Note that this would be 60*1000/(millis() - timeold)*rpmcount if the interrupt
+    //happened once per revolution instead of twice. Other multiples could be used
+    //for multi-bladed propellers or fans
+    unsigned int rpm = 15*1000/(millis() - timeold)*rpmcount;
+    Serial.println(rpmcount);
     data_sensor.rpm = (data_sensor.rpm + rpm) / 2;
+    timeold = millis();
+    rpmcount = 0;
+    //Restart the interrupt processing
+    attachInterrupt(0, rpm_counter, FALLING);
 
-    String terminal = "V: " + String(data_sensor.voltage, 3) + " I: " + String(data_sensor.current, 3) + " rpm: " + String(data_sensor.rpm, 0);
+
+    String terminal = "V: " + String(data_sensor.voltage, 3) + " I: " + String(data_sensor.current, 3) + " rpm: " + String(data_sensor.rpm) + " pin: " + String((pinArus/SENSOR_LOOP), 3);
     Serial.println(terminal);
 };
 
@@ -144,7 +160,7 @@ void cetak_data(void){
     lcd.print("I:" + String(data_sensor.current, 1));
 
     lcd.setCursor(0,1);
-    lcd.print("rpm:" + String(data_sensor.rpm, 0));
+    lcd.print("rpm:" + String(data_sensor.rpm));
 };
 
 void cetak_judul(void){
@@ -152,7 +168,26 @@ void cetak_judul(void){
     lcd.setCursor(0,0);
     lcd.print("Judul");
     lcd.setCursor(0,1);
-    lcd.print("Mahasiswa");
+    lcd.print("Depin");
 
     delay(3000);
 };
+
+float filterRpm(float input){
+	static FILTER_PROPERTIES prefInput;
+
+	return (float)filter(input, &prefInput);
+};
+
+float filter(float input, FILTER_PROPERTIES* fVariable){
+	fVariable->xtUpdate = fVariable->xtPrev;
+	fVariable->ptUpdate = fVariable->ptPref + CONSTANT_Q;
+	fVariable->kt = fVariable->ptUpdate / (fVariable->ptUpdate + CONSTANT_R);
+	fVariable->xt = fVariable->xtUpdate + (fVariable->kt * (input - fVariable->xtUpdate));
+	fVariable->pt = (1 - fVariable->kt) * fVariable->ptUpdate;
+	fVariable->xtPrev = fVariable->xt;
+	fVariable->ptPref = fVariable->ptUpdate;
+
+	return fVariable->xt;
+}
+
